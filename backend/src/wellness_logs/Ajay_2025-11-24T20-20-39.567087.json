@@ -1,0 +1,13 @@
+{
+  "timestamp": "2025-11-24T20:20:39.567087",
+  "name": "Ajay",
+  "mood": "good",
+  "energy": "eight on ten",
+  "stress": "none",
+  "objectives": [
+    "sleep on time",
+    "wake up on time"
+  ],
+  "self_care": "exercise",
+  "agent_summary": "User is feeling good with energy eight on ten, no stress, objectives are to sleep on time and wake up on time, with exercise for self-care."
+}

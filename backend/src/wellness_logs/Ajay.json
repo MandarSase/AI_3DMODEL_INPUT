@@ -1,0 +1,40 @@
+[
+  {
+    "timestamp": "2025-11-24T20:02:39.188645",
+    "name": "Ajay",
+    "mood": "good",
+    "energy": "five on ten",
+    "stress": "project deadline",
+    "objectives": [
+      "complete the project",
+      "get a sleep"
+    ],
+    "self_care": "work out little bit",
+    "agent_summary": "User is feeling good with energy five on ten, stressed about a project deadline. Objectives are to complete the project and get sleep, and plans to work out a little."
+  },
+  {
+    "timestamp": "2025-11-24T20:05:31.558924",
+    "name": "Ajay",
+    "mood": "great",
+    "energy": "eight on ten",
+    "stress": "none",
+    "objectives": [
+      "no specific objectives"
+    ],
+    "self_care": "make a painting",
+    "agent_summary": "User is feeling great with energy eight on ten, no stress, no specific objectives for today, and plans to make a painting for self-care."
+  },
+  {
+    "timestamp": "2025-11-24T20:20:39.567087",
+    "name": "Ajay",
+    "mood": "good",
+    "energy": "eight on ten",
+    "stress": "none",
+    "objectives": [
+      "sleep on time",
+      "wake up on time"
+    ],
+    "self_care": "exercise",
+    "agent_summary": "User is feeling good with energy eight on ten, no stress, objectives are to sleep on time and wake up on time, with exercise for self-care."
+  }
+]

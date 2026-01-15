@@ -1,8 +1,10 @@
-import logging
+#!/usr/bin/env python3
 import json
-import os
-import re
-from datetime import datetime
+import logging
+import asyncio
+from pathlib import Path
+from dataclasses import dataclass
+from typing import Optional, Dict, Any
 from dotenv import load_dotenv
 
 from livekit.agents import (
@@ -10,262 +12,239 @@ from livekit.agents import (
     AgentSession,
     JobContext,
     JobProcess,
-    MetricsCollectedEvent,
-    RoomInputOptions,
+    RoomInputOptions,  # your installed version expects this
     WorkerOptions,
     cli,
-    metrics,
-    tokenize,
+    function_tool,
+    RunContext,
 )
-from livekit.agents import function_tool, RunContext
 
-from livekit.plugins import murf, silero, google, deepgram, noise_cancellation
+from livekit.plugins import silero, deepgram, google, murf
 from livekit.plugins.turn_detector.multilingual import MultilingualModel
 
-# A local uploaded file path (kept for transparency / optional use)
-UPLOADED_FILE_PATH = "/mnt/data/4b23f3bb-6765-4c4b-8e8d-6ee909236850.png"
-
-logger = logging.getLogger("agent")
+# -------------------------------------------------------------------------
+# Config & Logging
+# -------------------------------------------------------------------------
 load_dotenv(".env.local")
+logger = logging.getLogger("model_request_agent")
+logger.setLevel(logging.DEBUG)
+h = logging.StreamHandler()
+h.setFormatter(logging.Formatter("%(asctime)s %(levelname)s %(message)s"))
+logger.addHandler(h)
 
 # -------------------------------------------------------------------------
-# Paths / persistence
+# Storage
 # -------------------------------------------------------------------------
-BASE_DIR = os.path.dirname(__file__)
-LOGS_DIR = os.path.join(BASE_DIR, "wellness_logs")
-os.makedirs(LOGS_DIR, exist_ok=True)
-
-
-# -------------------------
-# Filename / user helpers
-# -------------------------
-def sanitize_name(name: str) -> str:
-    if not name:
-        return "unknown"
-    name = name.strip()
-    name = re.sub(r"\s+", "_", name)
-    name = re.sub(r"[^A-Za-z0-9_-]", "", name)
-    return name or "unknown"
-
-
-def user_aggregate_file(safe_name: str) -> str:
-    return os.path.join(LOGS_DIR, f"{safe_name}.json")
-
-
-def user_session_filename(safe_name: str, ts: datetime) -> str:
-    iso = ts.isoformat().replace(":", "-")
-    return os.path.join(LOGS_DIR, f"{safe_name}_{iso}.json")
-
-
-def list_user_files_prefix(safe_name: str):
-    matches = []
-    try:
-        for fname in os.listdir(LOGS_DIR):
-            if not fname.lower().endswith(".json"):
-                continue
-            if fname.lower().startswith(safe_name.lower()):
-                matches.append(os.path.join(LOGS_DIR, fname))
-    except Exception as e:
-        logger.exception("error listing logs dir: %s", e)
-    return matches
-
-
-def load_json(path: str):
-    try:
-        with open(path, "r", encoding="utf-8") as f:
-            return json.load(f)
-    except Exception as e:
-        logger.exception("failed to load json %s: %s", path, e)
-        return None
-
-
-def save_json(path: str, data):
-    try:
-        with open(path, "w", encoding="utf-8") as f:
-            json.dump(data, f, ensure_ascii=False, indent=2)
-    except Exception as e:
-        logger.exception("failed to save json %s: %s", path, e)
-
-
-def find_latest_user_file(safe_name: str):
-    files = list_user_files_prefix(safe_name)
-    if not files:
-        return None, None
-    try:
-        files_sorted = sorted(files, key=lambda p: os.path.getmtime(p))
-        latest = files_sorted[-1]
-        data = load_json(latest)
-        return latest, data
-    except Exception as e:
-        logger.exception("failed to pick latest file for %s: %s", safe_name, e)
-        return None, None
-
+BASE = Path(__file__).resolve().parent
+REQUEST_DIR = BASE / "shared-data" / "model_requests"
+REQUEST_DIR.mkdir(parents=True, exist_ok=True)
 
 # -------------------------------------------------------------------------
-# Assistant: instruction ensures greeting first then asks name
+# State model
 # -------------------------------------------------------------------------
-class Assistant(Agent):
+@dataclass
+class RequestState:
+    request_id: Optional[str] = None
+    description: Optional[str] = None
+    model_type: Optional[str] = None
+    dimensions: Optional[str] = None
+    material: Optional[str] = None
+    extras: Dict[str, Any] = None
+    waiting_for: Optional[str] = None
+
+    def __post_init__(self):
+        if self.extras is None:
+            self.extras = {}
+
+class UD:
+    pass
+
+# -------------------------------------------------------------------------
+# Tools
+# -------------------------------------------------------------------------
+@function_tool
+async def record_initial_request(ctx: RunContext, text: str) -> str:
+    ud: UD = ctx.userdata
+    ud.req.description = text.strip()
+    ud.req.waiting_for = "model_type"
+    return "Great! What type of 3D model do you want?"
+
+@function_tool
+async def record_model_type(ctx: RunContext, model_type: str) -> str:
+    ud: UD = ctx.userdata
+    ud.req.model_type = model_type.strip()
+    ud.req.waiting_for = "dimensions"
+    return "Understood. What dimensions should the model have?"
+
+@function_tool
+async def record_dimensions(ctx: RunContext, dimensions: str) -> str:
+    ud: UD = ctx.userdata
+    ud.req.dimensions = dimensions.strip()
+    ud.req.waiting_for = "material"
+    return "Got it. What material or texture should be used?"
+
+@function_tool
+async def record_material(ctx: RunContext, material: str) -> str:
+    ud: UD = ctx.userdata
+    ud.req.material = material.strip()
+    ud.req.waiting_for = None
+    return "Noted. Any extra details?"
+
+@function_tool
+async def record_extra(ctx: RunContext, key: str, value: str) -> str:
+    ud: UD = ctx.userdata
+    ud.req.extras[key] = value
+    return "Extra detail added."
+
+@function_tool
+async def save_request(ctx: RunContext) -> str:
+    ud: UD = ctx.userdata
+    req = ud.req
+    req_id = req.request_id or f"request_{len(list(REQUEST_DIR.glob('*.json'))) + 1}"
+    req.request_id = req_id
+    with open(REQUEST_DIR / f"{req_id}.json", "w", encoding="utf-8") as f:
+        json.dump({
+            "request_id": req.request_id,
+            "description": req.description,
+            "model_type": req.model_type,
+            "dimensions": req.dimensions,
+            "material": req.material,
+            "extras": req.extras
+        }, f, indent=2)
+    return f"Saved your request as {req_id}!"
+
+# -------------------------------------------------------------------------
+# Agent
+# -------------------------------------------------------------------------
+class ModelRequestAgent(Agent):
     def __init__(self):
-        super().__init__(
-            instructions="""
-You are a warm, supportive, non-diagnostic Daily Wellness Companion.
+        instructions = """
+You are an AI assistant that collects 3D model requirements.
 
-MANDATES (must follow strictly):
-1) At the start of every session, greet the user and then ask for their name.
-   Example phrasing: "Hello! I'm your wellness companion. Before we begin, what's your name?"
-   Do NOT ask any other wellness questions until the user provides their name.
+Conversation flow:
+1. Ask user for request description.
+2. Use record_initial_request.
+3. Ask for model_type → dimensions → material → extras.
+4. When user says “save”, call save_request.
 
-2) When the user provides their name, call the backend function 'find_user_latest_log(name)'.
-   - If the function returns a previous log, read that log and ask exactly one short personalized follow-up
-     referencing the most relevant prior item (e.g., "Last time you mentioned trouble sleeping — did you sleep better today?").
-   - If no previous log was found, say: "Nice to meet you, {name}. Let's start your first check-in."
-
-3) After that, proceed to the standard short check-in flow, roughly in this order (adapt naturally):
-   - "How are you feeling today?" (mood)
-   - "What's your energy like right now?" (energy)
-   - "Anything stressing you out at the moment?" (stress; user may say 'no')
-   - "What are 1–3 things you'd like to get done today?" (objectives — allow comma separated)
-   - "Is there anything you'd like to do for yourself today? (rest, exercise, hobby)" (optional self-care)
-
-4) Offer 1–2 short, practical, non-medical suggestions (e.g., break tasks into small steps, take a 5-minute walk, 4 deep breaths).
-   Do NOT provide medical or diagnostic claims. If asked for medical advice, politely refuse and recommend a professional.
-
-5) Provide a concise recap with mood + 1–3 objectives and ask: "Does this sound right?"
-   - If the user confirms, call 'save_wellness_entry(name, mood, energy, stress, objectives, self_care, agent_summary)'.
-   - If the user asks to edit, accept edits for mood/energy/objectives/self-care, then save.
-
-Keep language short, empathetic, and actionable.
+Always end with a question so the user continues speaking.
+Keep responses short and friendly.
 """
+        super().__init__(
+            instructions=instructions,
+            tools=[
+                record_initial_request,
+                record_model_type,
+                record_dimensions,
+                record_material,
+                record_extra,
+                save_request,
+            ],
         )
 
-    @function_tool
-    async def find_user_latest_log(self, ctx: RunContext, name: str):
-        if not name:
-            return None
-        safe = sanitize_name(name)
-        path, data = find_latest_user_file(safe)
-        if not path:
-            return None
-        return {"path": path, "data": data}
-
-    @function_tool
-    async def save_wellness_entry(
-        self,
-        ctx: RunContext,
-        name: str,
-        mood: str,
-        energy: str,
-        stress: str,
-        objectives: list,
-        self_care: str,
-        agent_summary: str,
-    ):
-        try:
-            safe = sanitize_name(name) if name else "unknown"
-            ts = datetime.now()
-            entry = {
-                "timestamp": ts.isoformat(),
-                "name": name or "",
-                "mood": mood or "",
-                "energy": energy or "",
-                "stress": stress or "",
-                "objectives": objectives or [],
-                "self_care": self_care or "",
-                "agent_summary": agent_summary or "",
-            }
-
-            # append to aggregate
-            agg_path = user_aggregate_file(safe)
-            agg_data = []
-            if os.path.exists(agg_path):
-                existing = load_json(agg_path)
-                if isinstance(existing, list):
-                    agg_data = existing
-            agg_data.append(entry)
-            save_json(agg_path, agg_data)
-
-            # write per-session file
-            session_path = user_session_filename(safe, ts)
-            save_json(session_path, entry)
-
-            return {"status": "ok", "aggregate": agg_path, "session": session_path, "entry": entry}
-        except Exception as e:
-            logger.exception("save_wellness_entry failed: %s", e)
-            return {"status": "error", "message": str(e)}
-
-
 # -------------------------------------------------------------------------
-# PREWARM
+# Entrypoint helpers
 # -------------------------------------------------------------------------
 def prewarm(proc: JobProcess):
-    proc.userdata["vad"] = silero.VAD.load()
+    try:
+        proc.userdata["vad"] = silero.VAD.load(sensitivity=0.5)
+        logger.debug("Silero VAD loaded in prewarm.")
+    except Exception as e:
+        proc.userdata["vad"] = None
+        logger.warning("Could not load Silero VAD in prewarm, continuing without VAD: %s", e)
 
+async def _try_session_run(session: AgentSession):
+    """
+    Try to run the session using the following strategy:
+    1) Try session.run(user_input="") — required by many livekit-agents versions.
+    2) If that raises TypeError (signature mismatch), try session.run().
+    3) If that raises an API error from Gemini complaining about single-turn roles,
+       fallback to session.run() as well.
+    Returns True on success, False on failure.
+    """
+    # 1) Prefer explicit user_input for versions that require it.
+    try:
+        logger.debug("Attempting session.run(user_input='') ...")
+        await session.run(user_input="")
+        logger.info("session.run(user_input='') succeeded")
+        return True
+    except TypeError as te:
+        logger.debug("session.run(user_input='') TypeError (signature mismatch): %s", te)
+    except Exception as e:
+        # Check if it's a Gemini/GenAI client error complaining about roles (400).
+        msg = str(e)
+        logger.debug("session.run(user_input='') raised: %s", msg)
+        if "Please ensure that single turn requests end with a user role" in msg or "INVALID_ARGUMENT" in msg:
+            logger.warning("Gemini single-turn role error detected; will retry without user_input.")
+        else:
+            # If it's some other error, log and still attempt fallback
+            logger.warning("session.run(user_input='') failed; trying fallback: %s", e)
+
+    # 2) Fallback attempt without kwargs
+    try:
+        logger.debug("Attempting session.run() fallback ...")
+        await session.run()
+        logger.info("session.run() succeeded")
+        return True
+    except Exception as e:
+        logger.exception("session.run() fallback also failed: %s", e)
+        return False
 
 # -------------------------------------------------------------------------
-# ENTRYPOINT
+# Entrypoint
 # -------------------------------------------------------------------------
 async def entrypoint(ctx: JobContext):
-    ctx.log_context_fields = {"room": ctx.room.name}
+    ud = UD()
+    ud.req = RequestState(waiting_for="initial")
 
-    # Build voice pipeline (keep your existing choices)
     session = AgentSession(
         stt=deepgram.STT(model="nova-3"),
         llm=google.LLM(model="gemini-2.5-flash"),
-        tts=murf.TTS(
-            voice="en-US-matthew",
-            style="Conversation",
-            tokenizer=tokenize.basic.SentenceTokenizer(min_sentence_len=2),
-            text_pacing=True,
-        ),
+        tts=murf.TTS(voice="en-US-matthew"),
+        vad=ctx.proc.userdata.get("vad"),
         turn_detection=MultilingualModel(),
-        vad=ctx.proc.userdata["vad"],
-        preemptive_generation=True,
+        userdata=ud,
+        preemptive_generation=False,
     )
 
-    usage_collector = metrics.UsageCollector()
-
-    @session.on("metrics_collected")
-    def _on_metrics(ev: MetricsCollectedEvent):
-        metrics.log_metrics(ev.metrics)
-        usage_collector.collect(ev.metrics)
-
-    async def log_usage():
-        logger.info("Usage: %s", usage_collector.get_summary())
-
-    ctx.add_shutdown_callback(log_usage)
-
-    # Create assistant
-    agent = Assistant()
-
-    # NOTE: removed agent.append_message(...) here because Agent doesn't implement it.
-    # If you need to inject system context, include it in Assistant(instructions) or pass messages differently.
-
-    # Start session
-    await session.start(
-        agent=agent,
-        room=ctx.room,
-        room_input_options=RoomInputOptions(noise_cancellation=noise_cancellation.BVC()),
-    )
-
-    # Connect the worker to LiveKit room BEFORE attempting TTS
     await ctx.connect()
-    logger.info("Connected to LiveKit room, now triggering initial greeting (TTS)")
 
-    # Force the agent to speak the initial greeting and ask for name immediately.
+    # Start session (use RoomInputOptions for your installed version)
     try:
-        await session.say("Hello! I'm your wellness companion. Before we begin, what's your name?")
-    except Exception:
-        logger.debug("session.say failed or unavailable; model should ask naturally.")
-
-    # Start the session conversation loop so the agent processes incoming audio and replies.
-    try:
-        await session.run()
+        await session.start(
+            agent=ModelRequestAgent(),
+            room=ctx.room,
+            room_input_options=RoomInputOptions(),
+        )
+        logger.info("session.start() succeeded")
     except Exception as e:
-        logger.exception("session.run failed: %s", e)
+        logger.exception("session.start() failed. Check token grants (canPublish, canPublishData) and server: %s", e)
+        return
 
+    # small pause to let negotiation settle
+    await asyncio.sleep(0.5)
+
+    # say greeting
+    try:
+        await session.say("Hello! What 3D model request would you like to create?")
+        logger.info("session.say() succeeded")
+    except Exception as e:
+        logger.exception("session.say() failed: %s", e)
+        # continue — session may still run even if say failed
+
+    # run session (tries both forms, handles Gemini single-turn role error)
+    ok = await _try_session_run(session)
+    if not ok:
+        logger.error("session.run failed in all attempts. See logs above for details.")
+        # stop session cleanly if possible
+        try:
+            await session.stop()
+        except Exception:
+            pass
+        return
 
 # -------------------------------------------------------------------------
-# MAIN
+# Run worker
 # -------------------------------------------------------------------------
 if __name__ == "__main__":
     cli.run_app(WorkerOptions(entrypoint_fnc=entrypoint, prewarm_fnc=prewarm))
